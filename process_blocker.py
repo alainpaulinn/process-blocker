@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 r"""
-Windows 11 Process Blocker (Tray App)
-- Blocks processes whose name/cmdline matches a configurable pattern (default: "ManageEngine")
+Safer (Tray App)
 - Real-time (WMI) or polling detection
 - System tray menu for controls
-- Persistent config in %APPDATA%\ProcessBlocker\config.json
-- Rotating audit logs in %LOCALAPPDATA%\ProcessBlocker\logs\app.log
+- Persistent config in %APPDATA%\Safer\config.json
+- Rotating audit logs in %LOCALAPPDATA%\Safer\logs\app.log
 - Optional "Start with Windows" via HKCU\Software\Microsoft\Windows\CurrentVersion\Run
 Tested on Python 3.10+ on Windows 11.
 
@@ -13,7 +12,7 @@ Dependencies:
   pip install psutil pystray pillow wmi pywin32
 
 Packaging (recommended):
-  pyinstaller -y --noconsole --onefile --name ProcessBlocker process_blocker.py
+  pyinstaller -y --noconsole --onefile --name Safer process_blocker.py
 """
 
 import json
@@ -44,7 +43,7 @@ except Exception:
     HAVE_WMI = False
 
 
-APP_NAME = "ProcessBlocker"
+APP_NAME = "Safer"
 DEFAULT_PATTERN = "ManageEngine"
 APPDATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 LOCALAPPDATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
@@ -738,6 +737,17 @@ def main():
     ensure_dirs()
     cfg = Config(CONFIG_PATH)
     logger = setup_logging(cfg.get("log_level", "INFO"))
+    # Backward-compatible: if Safer config does not exist but old ProcessBlocker config exists, use it
+    try:
+        if not os.path.exists(CONFIG_PATH):
+            old_appdata = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ProcessBlocker")
+            old_config = os.path.join(old_appdata, "config.json")
+            if os.path.exists(old_config):
+                cfg.path = old_config
+                cfg.load()
+                logger.info("Loaded legacy configuration from ProcessBlocker folder.")
+    except Exception:
+        pass
 
     # Special mode: run Rules Editor in standalone process (Tk must be in main thread)
     if len(sys.argv) > 1 and sys.argv[1] == "--rules-editor":
