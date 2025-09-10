@@ -60,9 +60,119 @@ def ensure_dirs():
     os.makedirs(APPDATA_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
 
+def get_asset_path(relative_path: str) -> str:
+    """Return absolute path to an asset.
+    Works both when running from source and when packaged by PyInstaller.
+    """
+    try:
+        # PyInstaller extracts to a temp folder and sets _MEIPASS
+        base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+def load_app_icon_image(size: int = 64, rounded: bool = True) -> Image.Image:
+    """Load the app icon from assets and optionally apply a circular alpha mask."""
+    img = None
+    try:
+        logo_path = get_asset_path(os.path.join("assets", "logo.png"))
+        if os.path.exists(logo_path):
+            img = Image.open(logo_path).convert("RGBA")
+    except Exception:
+        img = None
+    if img is None:
+        # fallback simple mark
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        r = size // 2 - 2
+        center = (size // 2, size // 2)
+        d.ellipse([(center[0]-r, center[1]-r), (center[0]+r, center[1]+r)], outline=(0,0,0,255), width=2, fill=(255,255,255,255))
+        d.line([(size*0.25, size*0.75), (size*0.75, size*0.25)], fill=(0,0,0,255), width=6)
+    if img.size != (size, size):
+        try:
+            img = img.resize((size, size), Image.LANCZOS)
+        except Exception:
+            img = img.resize((size, size))
+    if rounded:
+        try:
+            mask = Image.new("L", (size, size), 0)
+            draw = ImageDraw.Draw(mask)
+            draw.ellipse((0, 0, size-1, size-1), fill=255)
+            img = img.copy()
+            img.putalpha(mask)
+        except Exception:
+            pass
+    return img
+
+def set_tk_window_icon(win):
+    """Set Tk window icon to app icon and retain reference to avoid GC."""
+    try:
+        from PIL import ImageTk  # type: ignore
+        img = load_app_icon_image(size=256, rounded=True)
+        win._pb_icon_imgtk = ImageTk.PhotoImage(img)
+        win.iconphoto(True, win._pb_icon_imgtk)
+    except Exception:
+        pass
+
 def is_admin() -> bool:
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
+    except Exception:
+        return False
+
+def enable_debug_privilege():
+    """Enable SeDebugPrivilege for the current process when running as admin."""
+    try:
+        SE_DEBUG_NAME = "SeDebugPrivilege"
+        TOKEN_ADJUST_PRIVILEGES = 0x20
+        TOKEN_QUERY = 0x8
+        SE_PRIVILEGE_ENABLED = 0x2
+
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+
+        class LUID(ctypes.Structure):
+            _fields_ = [("LowPart", ctypes.c_uint32), ("HighPart", ctypes.c_int32)]
+
+        class LUID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Luid", LUID), ("Attributes", ctypes.c_uint32)]
+
+        class TOKEN_PRIVILEGES(ctypes.Structure):
+            _fields_ = [("PrivilegeCount", ctypes.c_uint32), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+        token = ctypes.c_void_p()
+        if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ctypes.byref(token)):
+            return
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, SE_DEBUG_NAME, ctypes.byref(luid)):
+            return
+        tp = TOKEN_PRIVILEGES()
+        tp.PrivilegeCount = 1
+        tp.Privileges[0].Luid = luid
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+        advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
+    except Exception:
+        pass
+
+def restart_as_admin() -> bool:
+    """Attempt to restart the current program with elevated rights.
+    Returns True if elevation was initiated, False otherwise.
+    """
+    try:
+        # Build command
+        if getattr(sys, "frozen", False):
+            executable = sys.executable
+            params = ""
+        else:
+            executable = sys.executable
+            script_path = os.path.abspath(__file__)
+            args = " ".join(f'"{a}"' for a in sys.argv[1:])
+            params = f'"{script_path}" {args}'.strip()
+
+        # ShellExecuteW returns >32 on success
+        ShellExecuteW = ctypes.windll.shell32.ShellExecuteW
+        ret = ShellExecuteW(None, "runas", executable, params, None, 1)
+        return ret > 32
     except Exception:
         return False
 
@@ -98,15 +208,7 @@ def get_start_with_windows() -> bool:
         return False
 
 def build_icon(size=64) -> Image.Image:
-    # Simple shield-like circle with ban mark
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    r = size // 2 - 2
-    center = (size // 2, size // 2)
-    d.ellipse([(center[0]-r, center[1]-r), (center[0]+r, center[1]+r)], outline=(0,0,0,255), width=2, fill=(255,255,255,255))
-    # slash
-    d.line([(size*0.25, size*0.75), (size*0.75, size*0.25)], fill=(0,0,0,255), width=6)
-    return img
+    return load_app_icon_image(size=size, rounded=True)
 
 def now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -123,6 +225,9 @@ DEFAULT_CONFIG = {
     "start_with_windows": False,
     "log_level": "INFO",
     "kill_children": True,               # also try to kill child processes
+    # New configuration options
+    "rules": [],                         # list of {type: name|path|cmdline|regex, pattern: str, case_sensitive?: bool}
+    "auto_elevate_on_access_denied": True,
 }
 
 class Config:
@@ -130,6 +235,7 @@ class Config:
         self.path = path
         self.lock = threading.RLock()
         self.data = DEFAULT_CONFIG.copy()
+        self._mtime = 0.0
         self.load()
 
     def load(self):
@@ -141,7 +247,25 @@ class Config:
                     # merge with defaults to add new keys over time
                     merged = DEFAULT_CONFIG.copy()
                     merged.update(disk if isinstance(disk, dict) else {})
+                    # Migrate legacy single-pattern to multi-rules if rules empty
+                    rules = merged.get("rules")
+                    if not rules:
+                        legacy_pat = (merged.get("pattern") or "").strip()
+                        legacy_regex = bool(merged.get("use_regex", False))
+                        if legacy_pat:
+                            if legacy_regex:
+                                merged["rules"] = [{"type": "regex", "pattern": legacy_pat, "case_sensitive": False}]
+                            else:
+                                merged["rules"] = [
+                                    {"type": "name", "pattern": legacy_pat, "case_sensitive": False},
+                                    {"type": "path", "pattern": legacy_pat, "case_sensitive": False},
+                                    {"type": "cmdline", "pattern": legacy_pat, "case_sensitive": False},
+                                ]
                     self.data = merged
+                    try:
+                        self._mtime = os.path.getmtime(self.path)
+                    except Exception:
+                        pass
                 except Exception:
                     # keep defaults if corrupt
                     self.data = DEFAULT_CONFIG.copy()
@@ -153,6 +277,19 @@ class Config:
             tmp = self.data.copy()
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(tmp, f, indent=2)
+            try:
+                self._mtime = os.path.getmtime(self.path)
+            except Exception:
+                pass
+
+    def load_if_changed(self):
+        try:
+            if os.path.exists(self.path):
+                mtime = os.path.getmtime(self.path)
+                if mtime > (self._mtime or 0):
+                    self.load()
+        except Exception:
+            pass
 
     # helper getters/setters
     def get(self, key, default=None):
@@ -191,6 +328,7 @@ class ProcessBlocker:
         self.threads = []
         self.regex_cache = None
         self._compile_pattern()
+        self._elevation_attempted = False
 
     def _compile_pattern(self):
         pat = self.cfg.get("pattern", DEFAULT_PATTERN)
@@ -210,11 +348,63 @@ class ProcessBlocker:
         self._compile_pattern()
         self.log.info(f"Pattern updated: '{new_pattern}' (regex={use_regex})")
 
-    def match_process(self, name: str, cmdline: str) -> bool:
+    def match_process(self, name: str, exe_path: str, cmdline: str) -> bool:
+        """Return True if the process matches current blocking rules.
+        Supports legacy single pattern or new multi-rule config.
+        """
+        # Prefer multi-rules if present
+        rules = self.cfg.get("rules", []) or []
+        if rules:
+            exe_norm = exe_path or ""
+            name_norm = name or os.path.basename(exe_norm)
+            cmd_norm = cmdline or ""
+            for rule in rules:
+                try:
+                    r_type = (rule.get("type") or "").strip().lower()
+                    pattern = str(rule.get("pattern") or "")
+                    if not pattern:
+                        continue
+                    case_sensitive = bool(rule.get("case_sensitive", False))
+                    if not case_sensitive:
+                        pattern_cmp = pattern.lower()
+                        name_cmp = (name_norm or "").lower()
+                        exe_cmp = (exe_norm or "").lower()
+                        cmd_cmp = (cmd_norm or "").lower()
+                    else:
+                        pattern_cmp = pattern
+                        name_cmp = name_norm or ""
+                        exe_cmp = exe_norm or ""
+                        cmd_cmp = cmd_norm or ""
+
+                    if r_type == "name":
+                        # Match against provided name or basename of exe
+                        if pattern_cmp in name_cmp or pattern_cmp in os.path.basename(exe_cmp):
+                            return True
+                    elif r_type == "path":
+                        if pattern_cmp in exe_cmp:
+                            return True
+                    elif r_type == "cmdline":
+                        if pattern_cmp in cmd_cmp:
+                            return True
+                    elif r_type == "regex":
+                        flags = 0 if case_sensitive else re.IGNORECASE
+                        try:
+                            rx = re.compile(pattern, flags)
+                            combined = f"{name_norm} {exe_norm} {cmd_norm}"
+                            if rx.search(combined):
+                                return True
+                        except re.error as _:
+                            # Skip invalid regex silently; user can fix in UI
+                            continue
+                except Exception:
+                    continue
+            return False
+
+        # Legacy single-pattern behavior
         pat = self.cfg.get("pattern", DEFAULT_PATTERN)
         if not pat:
             return False
-        hay = f"{name} {cmdline}".lower()
+        hay = f"{name} {exe_path} {cmdline}".lower()
         if self.regex_cache:
             return bool(self.regex_cache.search(hay))
         return pat.lower() in hay
@@ -251,6 +441,23 @@ class ProcessBlocker:
                     self.log.info(f"KILLED pid={proc.pid}")
                 except Exception as e:
                     self.log.error(f"Failed to kill pid={proc.pid}: {e}")
+                # Try elevating if configured
+                if not is_admin() and self.cfg.get("auto_elevate_on_access_denied", True) and not self._elevation_attempted:
+                    self._elevation_attempted = True
+                    self.log.warning("Attempting to restart as Administrator due to AccessDenied…")
+                    if restart_as_admin():
+                        # Exit current instance; elevated instance will continue
+                        os._exit(0)
+                    else:
+                        self.log.error("Elevation failed or was cancelled.")
+                else:
+                    # As a last resort, try taskkill /F if admin
+                    if is_admin():
+                        try:
+                            subprocess.run(["taskkill", "/PID", str(proc.pid), "/F", "/T"], check=True, capture_output=True)
+                            self.log.info(f"TASKKILL /F success pid={proc.pid}")
+                        except Exception as e2:
+                            self.log.error(f"TASKKILL /F failed pid={proc.pid}: {e2}")
             except Exception as e:
                 self.log.error(f"Error terminating pid={proc.pid}: {e}")
 
@@ -266,13 +473,14 @@ class ProcessBlocker:
     def scan_existing(self):
         # On startup or when toggled, clean up any already-running matches
         count = 0
-        for p in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
+        for p in psutil.process_iter(attrs=["pid", "name", "cmdline", "exe"]):
             try:
                 name = p.info.get("name") or ""
+                exe_path = p.info.get("exe") or ""
                 cmd = " ".join(p.info.get("cmdline") or [])
-                if self.match_process(name, cmd):
+                if self.match_process(name, exe_path, cmd):
                     count += 1
-                    self.log.info(f"Match existing | pid={p.pid} name={name} cmd='{cmd}'")
+                    self.log.info(f"Match existing | pid={p.pid} name={name} exe='{exe_path}' cmd='{cmd}'")
                     self.kill_process_tree(p.pid)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
@@ -297,19 +505,45 @@ class ProcessBlocker:
                 watcher = c.Win32_Process.watch_for("creation")
                 self.log.info("WMI real-time watcher started.")
                 while not self.stop_event.is_set():
+                    # Hot-reload config/rules
+                    self.cfg.load_if_changed()
                     try:
                         evt = watcher(timeout_ms=1000)  # 1s timeout to allow stop checks
                         if evt is None:
                             continue
                         pid = int(evt.ProcessId)
+                        # Start with event-provided values
                         name = (evt.Caption or evt.Name or "").strip()
-                        cmdline = (evt.CommandLine or "").strip()
-                        if self.match_process(name, cmdline) and self.cfg.get("enabled", True):
-                            self.log.info(f"Match create | pid={pid} name={name} cmd='{cmdline}'")
+                        cmdline_evt = (evt.CommandLine or "").strip()
+                        exe_path = ""
+                        cmdline = cmdline_evt
+                        # Use psutil to get reliable exe and cmdline
+                        try:
+                            p = psutil.Process(pid)
+                            try:
+                                name = p.name() or name
+                            except Exception:
+                                pass
+                            try:
+                                exe_path = p.exe() or ""
+                            except Exception:
+                                exe_path = ""
+                            try:
+                                cmdline = " ".join(p.cmdline())
+                            except Exception:
+                                cmdline = cmdline_evt
+                        except Exception:
+                            # process may have already exited
+                            pass
+                        if self.match_process(name, exe_path, cmdline) and self.cfg.get("enabled", True):
+                            self.log.info(f"Match create | pid={pid} name={name} exe='{exe_path}' cmd='{cmdline}'")
                             self.kill_process_tree(pid)
                     except wmi.x_wmi_timed_out:
                         continue
                     except Exception as e:
+                        # Ignore transient errors when process exits between event and inspection
+                        if isinstance(e, psutil.NoSuchProcess):
+                            continue
                         self.log.error(f"WMI watch error: {e}")
                         time.sleep(1)
             except Exception as e:
@@ -327,15 +561,18 @@ class ProcessBlocker:
         while not self.stop_event.is_set():
             interval = max(1, int(self.cfg.get("poll_interval_sec", 3)))
             enabled = self.cfg.get("enabled", True)
+            # Hot-reload config/rules
+            self.cfg.load_if_changed()
             try:
-                for p in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
+                for p in psutil.process_iter(attrs=["pid", "name", "cmdline", "exe"]):
                     try:
                         name = p.info.get("name") or ""
+                        exe = p.info.get("exe") or ""
                         cmd = " ".join(p.info.get("cmdline") or [])
-                        if enabled and self.match_process(name, cmd):
+                        if enabled and self.match_process(name, exe, cmd):
                             key = (p.pid, name)
                             if key not in seen:
-                                self.log.info(f"Match poll | pid={p.pid} name={name} cmd='{cmd}'")
+                                self.log.info(f"Match poll | pid={p.pid} name={name} exe='{exe}' cmd='{cmd}'")
                                 seen.add(key)
                             self.kill_process_tree(p.pid)
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -428,24 +665,13 @@ class TrayApp:
                 self.icon.menu = self._build_menu()
             return inner
 
-        def _edit_pattern(icon, item):
-            # Simple console prompt (works even when packaged without console? Not ideal.)
-            # Better: use a tiny Tk dialog.
+        def _edit_rules(icon, item):
+            # Launch a separate process that runs the Tk editor in the main thread
             try:
-                import tkinter as tk
-                from tkinter import simpledialog, messagebox
-
-                root = tk.Tk()
-                root.withdraw()
-                current = self.cfg.get("pattern", DEFAULT_PATTERN)
-                new_pat = simpledialog.askstring(APP_NAME, f"Enter process match pattern:\n(substring or regex)", initialvalue=current)
-                if new_pat is None:
-                    return
-                use_regex = messagebox.askyesno(APP_NAME, "Use REGEX matching?\n(Yes = regex, No = simple substring)")
-                self.blocker.update_pattern(new_pat, use_regex)
-                messagebox.showinfo(APP_NAME, f"Pattern saved:\n{new_pat}\nregex={use_regex}")
+                args = [sys.executable, os.path.abspath(__file__), "--rules-editor"]
+                subprocess.Popen(args, creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
             except Exception as e:
-                self.log.error(f"Pattern edit failed: {e}")
+                self.log.error(f"Rules editor launch failed: {e}")
 
         def _open_logs(icon, item):
             try:
@@ -483,7 +709,8 @@ class TrayApp:
                     pystray.MenuItem("30s", _set_freq(30), checked=lambda item: poll_int == 30),
                 )
             ),
-            pystray.MenuItem("Edit pattern…", _edit_pattern),
+            pystray.MenuItem("Block rules…", _edit_rules),
+            pystray.MenuItem("Restart as Administrator", lambda icon, item: self._restart_admin()),
             pystray.MenuItem("Start with Windows", _toggle_startup, checked=lambda item: startup_checked),
             pystray.MenuItem("Open log folder", _open_logs),
             pystray.Menu.SEPARATOR,
@@ -493,6 +720,17 @@ class TrayApp:
     def run(self):
         self.icon.run()
 
+    def _restart_admin(self):
+        if is_admin():
+            self.log.info("Already running as Administrator.")
+            return
+        self.log.info("Restarting as Administrator…")
+        if restart_as_admin():
+            # terminate current to allow elevated instance to take over
+            os._exit(0)
+        else:
+            self.log.error("Elevation failed or cancelled.")
+
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
@@ -501,7 +739,103 @@ def main():
     cfg = Config(CONFIG_PATH)
     logger = setup_logging(cfg.get("log_level", "INFO"))
 
+    # Special mode: run Rules Editor in standalone process (Tk must be in main thread)
+    if len(sys.argv) > 1 and sys.argv[1] == "--rules-editor":
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+
+            root = tk.Tk()
+            root.title(f"{APP_NAME} - Block Rules")
+            root.geometry("900x520")
+            root.minsize(760, 400)
+            root.columnconfigure(0, weight=1)
+            root.rowconfigure(0, weight=1)
+            set_tk_window_icon(root)
+
+            frame = ttk.Frame(root, padding=10)
+            frame.grid(sticky="nsew")
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(1, weight=1)
+
+            # Toolbar
+            toolbar = ttk.Frame(frame)
+            toolbar.grid(row=0, column=0, sticky="ew", pady=(0,8))
+            ttk.Label(toolbar, text="Add rule:").pack(side=tk.LEFT)
+            type_var = tk.StringVar(value="name")
+            type_cb = ttk.Combobox(toolbar, textvariable=type_var, values=["name","path","cmdline","regex"], width=10, state="readonly")
+            type_cb.pack(side=tk.LEFT, padx=(6,6))
+            pattern_var = tk.StringVar()
+            pattern_entry = ttk.Entry(toolbar, textvariable=pattern_var)
+            pattern_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            cs_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(toolbar, text="Case sensitive", variable=cs_var).pack(side=tk.LEFT, padx=(8,8))
+            def add_rule():
+                pat = pattern_var.get().strip()
+                if not pat:
+                    return
+                rules = cfg.get("rules", []) or []
+                rules.append({"type": type_var.get(), "pattern": pat, "case_sensitive": bool(cs_var.get())})
+                cfg.set("rules", rules)
+                refresh()
+                pattern_var.set("")
+            ttk.Button(toolbar, text="Add", command=add_rule).pack(side=tk.LEFT)
+            def seed_manageengine():
+                defaults = [
+                    {"type": "name", "pattern": "ManageEngine", "case_sensitive": False},
+                    {"type": "path", "pattern": "ManageEngine", "case_sensitive": False},
+                    {"type": "cmdline", "pattern": "ManageEngine", "case_sensitive": False},
+                ]
+                rules = cfg.get("rules", []) or []
+                rules.extend(defaults)
+                cfg.set("rules", rules)
+                refresh()
+            ttk.Button(toolbar, text="Seed", command=seed_manageengine).pack(side=tk.LEFT, padx=(8,0))
+
+            # Tree
+            columns = ("type","pattern","case")
+            tv = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
+            tv.heading("type", text="Type")
+            tv.heading("pattern", text="Pattern")
+            tv.heading("case", text="Case sensitive")
+            tv.column("type", width=150, anchor=tk.W)
+            tv.column("pattern", width=600, anchor=tk.W)
+            tv.column("case", width=120, anchor=tk.W)
+            tv.grid(row=1, column=0, sticky="nsew")
+            vsb = ttk.Scrollbar(frame, orient="vertical", command=tv.yview)
+            tv.configure(yscroll=vsb.set)
+            vsb.grid(row=1, column=1, sticky="ns")
+
+            # Actions
+            btns = ttk.Frame(frame)
+            btns.grid(row=2, column=0, sticky="e", pady=(8,0))
+            def delete_selected():
+                sel = tv.selection()
+                if not sel:
+                    return
+                idx = int(sel[0])
+                rules = cfg.get("rules", []) or []
+                if 0 <= idx < len(rules):
+                    del rules[idx]
+                    cfg.set("rules", rules)
+                    refresh()
+            ttk.Button(btns, text="Delete", command=delete_selected).pack(side=tk.RIGHT)
+
+            def refresh():
+                tv.delete(*tv.get_children())
+                rules = cfg.get("rules", []) or []
+                for i, r in enumerate(rules):
+                    tv.insert("", "end", iid=str(i), values=(r.get("type",""), r.get("pattern",""), "Yes" if r.get("case_sensitive") else "No"))
+
+            refresh()
+            root.mainloop()
+        except Exception as e:
+            logger.error(f"Rules editor crashed: {e}")
+        return
+
     logger.info(f"{APP_NAME} starting. Admin={is_admin()}  Frozen={getattr(sys, 'frozen', False)}  WMI={'yes' if HAVE_WMI else 'no'}")
+    if is_admin():
+        enable_debug_privilege()
     # Ensure registry reflects current config
     try:
         if cfg.get("start_with_windows", False) != get_start_with_windows():
